@@ -98,7 +98,6 @@ module riscvpipeline (
          DE_instr <= 32'b0;
       end
 
-      // Read register bank with write-back bypass for same cycle
       if (writeBackEn && wbRdId == rs1Id(FD_instr) && rs1Id(FD_instr) != 0) begin
          DE_rs1 <= writeBackData;
       end else begin
@@ -116,11 +115,9 @@ module riscvpipeline (
       end
    end
 
-/* Hazard detection and control signals */
    wire F_stall, D_stall;
    wire D_flush, E_flush;
 
-   // detect load-use hazards: when DE is load and FD reads its rd
    wire rs1Hazard = readsRs1(FD_instr) && rs1Id(FD_instr) != 0 && (writesRd(DE_instr) && rs1Id(FD_instr) == rdId(DE_instr));
    wire rs2Hazard = readsRs2(FD_instr) && rs2Id(FD_instr) != 0 && (writesRd(DE_instr) && rs2Id(FD_instr) == rdId(DE_instr));
    wire dataHazard = !FD_nop && isLoad(DE_instr) && (rs1Hazard || rs2Hazard);
@@ -137,7 +134,7 @@ module riscvpipeline (
    reg [31:0] EM_rs2;
    reg [31:0] EM_Eresult;
    reg [31:0] EM_addr;
-   // Forwarding from EM and MW stages into Execute
+   
    wire E_M_fwd_rs1 = (rdId(EM_instr) != 0) && writesRd(EM_instr) && (rdId(EM_instr) == rs1Id(DE_instr));
    wire E_W_fwd_rs1 = (rdId(MW_instr) != 0) && writesRd(MW_instr) && (rdId(MW_instr) == rs1Id(DE_instr));
    wire E_M_fwd_rs2 = (rdId(EM_instr) != 0) && writesRd(EM_instr) && (rdId(EM_instr) == rs2Id(DE_instr));
