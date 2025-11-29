@@ -47,7 +47,6 @@ module riscvpipeline (
    function readsRs2; input [31:0] I; readsRs2 = isALUreg(I) || isBranch(I) || isStore(I); endfunction
 
 /**********************  F: Instruction fetch *********************************/
-   localparam NOP = 32'b0000000_00000_00000_000_00000_0110011;
    reg [31:0] F_PC;
    reg [31:0] FD_PC;
    reg [31:0] FD_instr;
@@ -59,15 +58,23 @@ module riscvpipeline (
    wire        jumpOrBranch;
 
    always @(posedge clk) begin
-      FD_instr <= Instr;
-      FD_PC    <= F_PC;
-      F_PC     <= F_PC + 4;
-      if (jumpOrBranch)
-    	   F_PC     <= jumpOrBranchAddress;
-      FD_nop <= reset;
-      if (reset)
-    	   F_PC <= 0;
+      if (!F_stall) begin
+         FD_instr <= Instr;
+         FD_PC    <= F_PC;
+         F_PC     <= F_PC + 4;
+      end
+
+      if (jumpOrBranch) begin
+         F_PC <= jumpOrBranchAddress;
+      end
+
+      FD_nop <= D_flush | reset;
+
+      if (reset) begin
+         F_PC <= 0;
+      end
    end
+
 
 /************************ D: Instruction decode *******************************/
    reg [31:0] DE_PC;
@@ -82,13 +89,47 @@ module riscvpipeline (
 
    reg [31:0] RegisterBank [0:31];
    always @(posedge clk) begin
-      DE_PC    <= FD_PC;
-      DE_instr <= FD_nop ? NOP : FD_instr;
-      DE_rs1 <= rs1Id(FD_instr) ? RegisterBank[rs1Id(FD_instr)] : 32'b0;
-      DE_rs2 <= rs2Id(FD_instr) ? RegisterBank[rs2Id(FD_instr)] : 32'b0;
-      if (writeBackEn)
-	      RegisterBank[wbRdId] <= writeBackData;
+      if (!D_stall) begin
+         DE_PC <= FD_PC;
+         DE_instr <= (E_flush | FD_nop) ? 32'b0 : FD_instr;
+      end
+
+      if (E_flush) begin
+         DE_instr <= 32'b0;
+      end
+
+      // Read register bank with write-back bypass for same cycle
+      if (writeBackEn && wbRdId == rs1Id(FD_instr) && rs1Id(FD_instr) != 0) begin
+         DE_rs1 <= writeBackData;
+      end else begin
+         DE_rs1 <= rs1Id(FD_instr) ? RegisterBank[rs1Id(FD_instr)] : 32'b0;
+      end
+
+      if (writeBackEn && wbRdId == rs2Id(FD_instr) && rs2Id(FD_instr) != 0) begin
+         DE_rs2 <= writeBackData;
+      end else begin
+         DE_rs2 <= rs2Id(FD_instr) ? RegisterBank[rs2Id(FD_instr)] : 32'b0;
+      end
+
+      if (writeBackEn) begin
+         RegisterBank[wbRdId] <= writeBackData;
+      end
    end
+
+/* Hazard detection and control signals */
+   wire F_stall, D_stall;
+   wire D_flush, E_flush;
+
+   // detect load-use hazards: when DE is load and FD reads its rd
+   wire rs1Hazard = readsRs1(FD_instr) && rs1Id(FD_instr) != 0 && (writesRd(DE_instr) && rs1Id(FD_instr) == rdId(DE_instr));
+   wire rs2Hazard = readsRs2(FD_instr) && rs2Id(FD_instr) != 0 && (writesRd(DE_instr) && rs2Id(FD_instr) == rdId(DE_instr));
+   wire dataHazard = !FD_nop && isLoad(DE_instr) && (rs1Hazard || rs2Hazard);
+
+   assign F_stall = dataHazard | halt;
+   assign D_stall = dataHazard | halt;
+
+   assign D_flush = jumpOrBranch;
+   assign E_flush = jumpOrBranch | dataHazard;
 
 /************************ E: Execute *****************************************/
    reg [31:0] EM_PC;
@@ -96,8 +137,22 @@ module riscvpipeline (
    reg [31:0] EM_rs2;
    reg [31:0] EM_Eresult;
    reg [31:0] EM_addr;
-   wire [31:0] E_aluIn1 = DE_rs1;
-   wire [31:0] E_aluIn2 = isALUreg(DE_instr) | isBranch(DE_instr) ? DE_rs2 : Iimm(DE_instr);
+   // Forwarding from EM and MW stages into Execute
+   wire E_M_fwd_rs1 = (rdId(EM_instr) != 0) && writesRd(EM_instr) && (rdId(EM_instr) == rs1Id(DE_instr));
+   wire E_W_fwd_rs1 = (rdId(MW_instr) != 0) && writesRd(MW_instr) && (rdId(MW_instr) == rs1Id(DE_instr));
+   wire E_M_fwd_rs2 = (rdId(EM_instr) != 0) && writesRd(EM_instr) && (rdId(EM_instr) == rs2Id(DE_instr));
+   wire E_W_fwd_rs2 = (rdId(MW_instr) != 0) && writesRd(MW_instr) && (rdId(MW_instr) == rs2Id(DE_instr));
+
+   wire [31:0] E_rs1 = E_M_fwd_rs1 ? EM_Eresult :
+                        E_W_fwd_rs1 ? writeBackData :
+                        DE_rs1;
+
+   wire [31:0] E_rs2 = E_M_fwd_rs2 ? EM_Eresult :
+                        E_W_fwd_rs2 ? writeBackData :
+                        DE_rs2;
+
+   wire [31:0] E_aluIn1 = E_rs1;
+   wire [31:0] E_aluIn2 = (isALUreg(DE_instr) | isBranch(DE_instr)) ? E_rs2 : Iimm(DE_instr);
    wire [4:0]  E_shamt  = isALUreg(DE_instr) ? DE_rs2[4:0] : shamt(DE_instr);
    wire E_minus = DE_instr[30] & isALUreg(DE_instr);
    wire E_arith_shift = DE_instr[30];
@@ -174,7 +229,7 @@ module riscvpipeline (
    always @(posedge clk) begin
       EM_PC      <= DE_PC;
       EM_instr   <= DE_instr;
-      EM_rs2     <= DE_rs2;
+      EM_rs2     <= E_rs2;
       EM_Eresult <= E_result;
       EM_addr    <= isStore(DE_instr) ? DE_rs1 + Simm(DE_instr) :
                                         DE_rs1 + Iimm(DE_instr) ;
